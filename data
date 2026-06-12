@@ -1,0 +1,154 @@
+
+01. 데이터 전처리 (Preprocessing)
+토마토 스마트팜 환경 데이터 및 생장 데이터를 불러와 AI 학습에 적합한 형태로 변환합니다.
+
+처리 순서
+
+환경 센서 CSV 로드 → 핵심 컬럼 추출
+VPD(증기압 부족) 계산
+2분 단위 → 일별 데이터로 압축, GDD(적산온도) 계산
+JSON 생장 데이터 로드 및 병합
+이상치 제거 및 시차 변수(Rolling Window) 생성
+
+import pandas as pd
+import numpy as np
+import glob
+import os
+import json
+import zipfile
+
+# Google Drive 마운트 (Colab 환경)
+from google.colab import drive
+drive.mount('/content/drive')
+     
+1. 환경 센서 데이터 로드 및 통합
+
+# 전체 농가 CSV 파일 경로 설정
+base_path = '/content/drive/MyDrive/Train_dataset/원천데이터_230630_add/TS_Timeseries/TS_Timeseries'
+
+all_csv_files = glob.glob(os.path.join(base_path, 'tom*/**/*.csv'), recursive=True) + \
+                glob.glob(os.path.join(base_path, 'tom*/**/*.CSV'), recursive=True)
+
+print(f'환경데이터 CSV 파일: {len(all_csv_files)}개')
+
+df_list = []
+for file in all_csv_files:
+    try:
+        try:
+            temp_df = pd.read_csv(file, encoding='utf-8')
+        except:
+            temp_df = pd.read_csv(file, encoding='cp949')
+        if '내부PT100온도센서1번건구' in temp_df.columns:
+            df_list.append(temp_df)
+    except:
+        pass
+
+df_env_all = pd.concat(df_list, ignore_index=True)
+print(f'통합 완료: {len(df_list)}개 파일, 총 {len(df_env_all):,}줄')
+     
+2. 핵심 컬럼 추출 및 VPD 계산
+
+# 핵심 컬럼 추출
+df_env_all['date'] = pd.to_datetime(df_env_all['date'], errors='coerce')
+target_cols = ['date', '현재일사(W)', '내부PT100온도센서1번건구', '내부PT100센서를이용한계산습도']
+df_core = df_env_all[target_cols].dropna().copy()
+df_core.columns = ['date', 'solar_rad', 'temp', 'humidity']
+
+# VPD(증기압 부족) 계산
+def calculate_vpd(temp, humidity):
+    """온도(℃)와 상대습도(%)로 VPD(kPa)를 계산합니다."""
+    svp = 0.61078 * np.exp((17.27 * temp) / (temp + 237.3))
+    avp = svp * (humidity / 100)
+    return svp - avp
+
+df_core['VPD'] = calculate_vpd(df_core['temp'], df_core['humidity'])
+print('VPD 계산 완료')
+print(df_core.head())
+     
+3. 일별 압축 및 GDD(적산온도) 계산
+
+# 2분 단위 → 일별 압축
+df_core['day'] = df_core['date'].dt.date
+df_daily = df_core.groupby('day').agg(
+    temp=('temp', 'mean'),
+    humidity=('humidity', 'mean'),
+    VPD=('VPD', 'mean'),
+    solar_rad=('solar_rad', 'sum')
+).reset_index()
+
+# GDD 계산 (토마토 기준온도: 10℃)
+BASE_TEMP = 10
+df_daily['GDD'] = (df_daily['temp'] - BASE_TEMP).clip(lower=0).cumsum()
+
+df_daily['date'] = pd.to_datetime(df_daily['day'])
+df_daily = df_daily.drop(columns=['day'])
+
+print(f'일별 데이터 구축 완료: {len(df_daily):,}일')
+print(df_daily.head())
+     
+4. 생장 데이터(JSON) 로드
+
+zip_path = '/content/drive/MyDrive/Train_dataset.zip'
+extract_path = '/content/Train_dataset_fast'
+
+print('압축 해제 중...')
+with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+    zip_ref.extractall(extract_path)
+print('압축 해제 완료')
+
+json_files = glob.glob(os.path.join(extract_path, '**/*.json'), recursive=True)
+json_files += glob.glob(os.path.join(extract_path, '**/*.JSON'), recursive=True)
+print(f'JSON 파일: {len(json_files)}개')
+
+extracted_data = []
+for file_path in json_files:
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            date_str = data.get('file_attributes', {}).get('date', None)
+            height = data.get('growth_indicators', {}).get('plantHeight', None)
+            weekly = data.get('growth_indicators', {}).get('weeklyGrowth', None)
+            if date_str is not None and height is not None:
+                extracted_data.append({'date': date_str, 'plantHeight': height, 'weeklyGrowth': weekly})
+    except:
+        pass
+
+df_growth = pd.DataFrame(extracted_data)
+df_growth['date'] = pd.to_datetime(df_growth['date'], format='%Y%m%d', errors='coerce')
+df_growth = df_growth.dropna(subset=['date'])
+print(f'생장 데이터 로드 완료: {len(df_growth)}줄')
+     
+5. 환경 + 생장 데이터 병합 및 이상치 제거
+
+# 시차 변수(Rolling Window) 생성
+df_lag = df_daily.sort_values('date').copy()
+df_lag['temp_3d_avg']  = df_lag['temp'].rolling(window=3).mean()
+df_lag['hum_3d_avg']   = df_lag['humidity'].rolling(window=3).mean()
+df_lag['solar_3d_avg'] = df_lag['solar_rad'].rolling(window=3).mean()
+df_lag['VPD_3d_avg']   = df_lag['VPD'].rolling(window=3).mean()
+
+# 병합
+df_merged = pd.merge(df_growth, df_lag, on='date', how='inner').dropna()
+
+# 생리적 이상치 제거
+df_merged = df_merged[
+    (df_merged['temp'] > 0) & (df_merged['temp'] < 50) &
+    (df_merged['humidity'] > 10) &
+    (df_merged['solar_rad'] >= 0)
+]
+
+# IQR 이상치 제거 (weeklyGrowth)
+def remove_outliers_iqr(df, column):
+    Q1, Q3 = df[column].quantile([0.25, 0.75])
+    IQR = Q3 - Q1
+    return df[(df[column] >= Q1 - 1.5 * IQR) & (df[column] <= Q3 + 1.5 * IQR)]
+
+df_final = remove_outliers_iqr(df_merged, 'weeklyGrowth')
+
+print(f'최종 학습용 데이터: {len(df_final)}개')
+print(df_final.head())
+
+# 다음 노트북에서 사용할 수 있도록 저장
+df_final.to_csv('/content/drive/MyDrive/df_final_preprocessed.csv', index=False)
+print('전처리 완료 → df_final_preprocessed.csv 저장됨')
+     
